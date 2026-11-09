@@ -61,6 +61,8 @@ Copa에는 Anthropic 형식의 `POST /v1/messages`로 모델과 프롬프트를 
 - **POST**는 모델에 새 결과 생성을 요청합니다. `POST /v1/messages`의 요청 본문 예시는 `{"model":"claude-haiku-4","max_tokens":2048,"messages":[{"role":"user","content":"여행지 추천"}]}`이고, 응답 예시는 `{"content":[{"type":"text","text":"생성 결과"}]}`입니다.
 - **GET**은 장소 데이터를 조회합니다. `GET /v2/local/search/keyword.json?query=제주%20맛집&category_group_code=FD6&size=5`의 응답 예시는 `{"documents":[{"place_name":"예시 식당","x":"126.5","y":"33.5"}]}`입니다.
 
+LLM의 1차 응답을 구조화된 JSON으로 출력하도록 요구하면 `json.loads()`로 쉽게 파싱하고 필수 키와 값의 타입을 검증할 수 있습니다. 검증한 `recommended_cities` 배열은 자유 형식의 문장에서 도시 이름을 다시 추출할 필요 없이 다음 단계인 카카오 맛집 검색의 입력으로 바로 재사용할 수 있습니다.
+
 1차 응답은 다음 JSON 구조를 사용합니다.
 
 ```json
