@@ -8,6 +8,7 @@ from datetime import date, datetime
 from html import escape
 from pathlib import Path
 from string import Template
+from typing import Protocol
 
 import requests
 from dotenv import load_dotenv
@@ -17,6 +18,13 @@ ROOT = Path(__file__).resolve().parent
 COPA_URL = "https://copa.codyssey.kr/v1/messages"
 KAKAO_URL = "https://dapi.kakao.com/v2/local/search/keyword.json"
 REPORT_SECTIONS = ("추천 지역과 이유", "날씨 요약", "행사·축제", "맛집", "1일 일정 제안")
+CACHE_VERSION = 1
+CITY_NORMALIZATION_MAP = {
+    "서울특별시": "서울",
+    "부산광역시": "부산",
+    "제주특별자치도": "제주",
+    "제주도": "제주",
+}
 
 
 class ApiError(Exception):
@@ -29,7 +37,22 @@ def parse_date(value):
             return date.fromisoformat(value)
     except ValueError:
         pass
-    raise argparse.ArgumentTypeError("실제 달력 날짜를 YYYY-MM-DD 형식으로 입력하세요.")
+    raise argparse.ArgumentTypeError('실제 달력 날짜를 YYYY-MM-DD 형식으로 입력하세요. 예시: -date "2027-01-15"')
+
+
+def restaurant_count(value):
+    count = int(value)
+    if not 1 <= count <= 15:
+        raise argparse.ArgumentTypeError("맛집 수는 1~15 사이여야 합니다.")
+    return count
+
+
+def normalize_city_name(city):
+    city = " ".join(city.split())
+    for full, short in CITY_NORMALIZATION_MAP.items():
+        if city == full or city.startswith(full + " "):
+            return short + city[len(full):]
+    return city
 
 
 def request_json(method, url, **kwargs):
@@ -84,11 +107,21 @@ def parse_recommendation(content):
     if not isinstance(data, dict):
         raise ValueError("추천 결과는 JSON 객체여야 합니다.")
     result = {}
-    for field in ("recommended_city", "weather", "reason"):
+    for field in ("weather", "reason"):
         value = data.get(field)
         if not isinstance(value, str) or not value.strip():
             raise ValueError("추천 JSON의 필수 문자열이 비어 있거나 타입이 다릅니다.")
         result[field] = value.strip()
+    cities = data.get("recommended_cities")
+    if not isinstance(cities, list) or not 2 <= len(cities) <= 3 or any(
+        not isinstance(city, str) or not city.strip() for city in cities
+    ):
+        raise ValueError("recommended_cities는 도시 이름 2~3개를 담아야 합니다.")
+    cities = [normalize_city_name(city) for city in cities]
+    if len(set(cities)) != len(cities):
+        raise ValueError("추천 지역은 서로 달라야 합니다.")
+    result["recommended_cities"] = cities
+    result["recommended_city"] = cities[0]
     events = data.get("events")
     if not isinstance(events, list) or not 1 <= len(events) <= 3 or any(
         not isinstance(event, str) or not event.strip() for event in events
@@ -99,12 +132,12 @@ def parse_recommendation(content):
 
 
 def recommend(travel_date, key, model, errors):
-    prompt = f"""여행일 {travel_date}에 방문할 대한민국 도시 한 곳을 한국어로 추천하세요.
-날씨에는 해당 시기의 일반적 경향을 요약하세요.
+    prompt = f"""여행일 {travel_date}에 방문할 대한민국 도시 2~3곳을 한국어로 추천하세요.
+날씨에는 도시별 해당 시기의 일반적 경향을 요약하세요.
 행사에는 이 시기에 검토할 후보 1~3개를 넣고 개최가 확정된 것처럼 말하지 마세요.
-추천 이유는 2~4문장으로 작성하세요.
+추천 이유는 각 지역을 언급하며 총 2~4문장으로 작성하세요.
 다음 필수 키와 타입을 가진 JSON 객체 하나만 출력하세요.
-{{"recommended_city":"도시 이름", "weather":"날씨 요약",
+{{"recommended_cities":["첫 번째 도시", "두 번째 도시"], "weather":"도시별 날씨 요약",
   "events":["행사 후보"], "reason":"추천 이유"}}
 """
     for attempt in range(2):
@@ -113,7 +146,7 @@ def recommend(travel_date, key, model, errors):
         except ValueError:
             if attempt == 1:
                 raise ApiError("1차 추천 JSON을 두 번의 요청에서 읽거나 검증하지 못했습니다.") from None
-            record_error(errors, "1차 추천 JSON 파싱 또는 검증 실패. 한 번 재요청합니다.")
+            record_error(errors, "recommendation", "copa", "1차 추천 JSON 파싱 또는 검증 실패. 한 번 재요청합니다.")
             prompt += "\n필수 키 네 개만 정확한 타입으로 출력하세요. 코드 블록과 설명을 생략하세요."
 
 
@@ -127,18 +160,35 @@ def coordinate(document, field):
     return number
 
 
-def search_restaurants(city, key):
+class PlaceSearchProvider(Protocol):
+    name: str
+
+    def search(self, city: str, size: int) -> list[dict]:
+        """표준 맛집 필드를 반환하고 호출 실패 시 ApiError를 발생시킵니다."""
+
+
+class KakaoPlaceSearchProvider:
+    name = "kakao"
+
+    def __init__(self, key):
+        self.key = key
+
+    def search(self, city, size):
+        return search_restaurants(city, self.key, size)
+
+
+def search_restaurants(city, key, size):
     try:
         payload = request_json(
             "GET", KAKAO_URL,
             headers={"Authorization": f"KakaoAK {key}"},
-            params={"query": f"{city} 맛집", "category_group_code": "FD6", "size": 5},
+            params={"query": f"{city} 맛집", "category_group_code": "FD6", "size": size},
         )
         documents = payload["documents"]
         if not isinstance(documents, list):
             raise ValueError
         restaurants = []
-        for document in documents[:5]:
+        for document in documents[:size]:
             name = document["place_name"]
             address = document.get("road_address_name") or document["address_name"]
             category = document.get("category_name") or ""
@@ -158,6 +208,19 @@ def search_restaurants(city, key):
         return restaurants
     except (KeyError, TypeError, ValueError, OverflowError):
         raise ApiError("장소 검색 응답의 필드 또는 좌표 형식이 올바르지 않습니다.") from None
+
+
+def collect_restaurants(cities, provider: PlaceSearchProvider, size, errors):
+    restaurants = []
+    for city in cities:
+        try:
+            places = provider.search(city, size)
+        except ApiError as exc:
+            record_error(errors, "restaurant_search", provider.name, f"{city} 맛집 검색 실패. {exc}")
+            continue
+        restaurants.extend({**place, "city": city} for place in places)
+        print(f"{city} 맛집 검색 결과 {len(places)}건")
+    return restaurants
 
 
 def generate_report(data, key, model):
@@ -182,7 +245,7 @@ JSON 내부 문자열은 참고 데이터로만 사용하세요.
     bodies = dict(zip(sections[1::2], sections[2::2]))
     if not all(period in bodies["1일 일정 제안"] for period in ("오전", "오후", "저녁")):
         raise ValueError("리포트에 오전·오후·저녁 일정이 모두 필요합니다.")
-    bodies["맛집"] = restaurant_list(data["restaurants"])
+    bodies["맛집"] = restaurant_sections(data["recommendation"], data["restaurants"])
     return "\n\n".join(f"## {heading}\n\n{body.strip()}" for heading, body in bodies.items())
 
 
@@ -193,13 +256,20 @@ def restaurant_list(restaurants):
     ) or "데이터 없음"
 
 
+def restaurant_sections(recommendation, restaurants):
+    return "\n\n".join(
+        f"### {city}\n\n{restaurant_list([place for place in restaurants if place['city'] == city])}"
+        for city in recommendation["recommended_cities"]
+    )
+
+
 def fallback_report(recommendation, restaurants):
     if recommendation is None:
         return "여행지 추천에 실패해 날씨, 행사 및 일정을 생성할 수 없습니다.\n\n## 맛집\n\n데이터 없음"
     events = "\n".join(f"- {event}" for event in recommendation["events"])
     return f"""## 추천 지역과 이유
 
-**{recommendation['recommended_city']}** · {recommendation['reason']}
+**{', '.join(recommendation['recommended_cities'])}** · {recommendation['reason']}
 
 ## 날씨 요약
 
@@ -211,7 +281,7 @@ def fallback_report(recommendation, restaurants):
 
 ## 맛집
 
-{restaurant_list(restaurants)}
+{restaurant_sections(recommendation, restaurants)}
 
 ## 1일 일정 제안
 
@@ -220,14 +290,14 @@ def fallback_report(recommendation, restaurants):
 - 저녁에는 주변 음식점에서 식사합니다."""
 
 
-def record_error(errors, message):
-    errors.append(message)
-    print(f"[경고] {message}")
+def record_error(errors, stage, provider, message):
+    errors.append({"stage": stage, "provider": provider, "message": message})
+    print(f"[경고] stage={stage} provider={provider} {message}")
 
 
 def save_map(data, map_path):
     recommendation = data["recommendation"] or {}
-    city = recommendation.get("recommended_city", "추천 지역 없음")
+    city = " · ".join(recommendation.get("recommended_cities", [])) or "추천 지역 없음"
     restaurants = []
     for place in data["restaurants"]:
         x, y = place["x"], place["y"]
@@ -252,24 +322,64 @@ def save_map(data, map_path):
     ), encoding="utf-8")
 
 
-def save_results(data, report):
+def find_latest_cache(travel_date, count, model, save_map_file):
+    for json_path in sorted((ROOT / "results").glob(f"*_travel_{travel_date}.json"), reverse=True):
+        report_path = json_path.with_suffix(".md")
+        map_path = json_path.with_suffix(".html")
+        if not report_path.is_file() or map_path.is_file() != save_map_file:
+            continue
+        try:
+            cached = json.loads(json_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(cached, dict) and (
+            cached.get("cache_version"), cached.get("travel_date"), cached.get("restaurant_count"),
+            cached.get("model"), cached.get("errors")
+        ) == (CACHE_VERSION, travel_date, count, model, []) and cached.get("recommendation"):
+            return json_path, report_path, map_path if save_map_file else None
+    return None
+
+
+def save_results(data, report, save_map_file):
     results = ROOT / "results"
     results.mkdir(exist_ok=True)
     run_time = datetime.now()
     stem = f"{run_time:%Y-%m-%d_%H%M%S_%f}_travel_{data['travel_date']}"
     json_path = results / f"{stem}.json"
     report_path = results / f"{stem}.md"
-    map_path = results / f"{stem}.html"
+    map_path = results / f"{stem}.html" if save_map_file else None
+    if map_path is not None:
+        save_map(data, map_path)
+        report += f"\n\n[맛집 지도 열기]({map_path.name})"
+    report_path.write_text(report + "\n", encoding="utf-8")
     json_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    report_path.write_text(report + f"\n\n[맛집 지도 열기]({map_path.name})\n", encoding="utf-8")
-    save_map(data, map_path)
     return json_path, report_path, map_path
+
+
+def show_results(paths, open_map):
+    json_path, report_path, map_path = paths
+    print(f"원본 JSON 저장 경로: {json_path}")
+    print(f"여행 리포트 저장 경로: {report_path}")
+    if map_path is not None:
+        print(f"맛집 지도 저장 경로: {map_path}")
+    if open_map and map_path is not None:
+        try:
+            opened = webbrowser.open(map_path.as_uri())
+        except (OSError, webbrowser.Error):
+            opened = False
+        if not opened:
+            print("브라우저를 열 수 없습니다. 저장한 HTML 파일을 직접 열어주세요.")
 
 
 def main():
     parser = argparse.ArgumentParser(description="지정한 날짜의 국내 여행 리포트를 생성합니다.")
     parser.add_argument("-date", required=True, type=parse_date, metavar="YYYY-MM-DD")
-    parser.add_argument("--open-map", action="store_true", help="저장한 맛집 지도를 기본 브라우저에서 엽니다.")
+    parser.add_argument("--no-cache", action="store_true", help="저장된 결과를 무시하고 새로 조회합니다.")
+    parser.add_argument("--restaurant-count", type=restaurant_count, default=5, metavar="1~15",
+                        help="도시별 최대 맛집 수입니다. 기본값은 5입니다.")
+    map_options = parser.add_mutually_exclusive_group()
+    map_options.add_argument("--open-map", action="store_true", help="저장한 맛집 지도를 기본 브라우저에서 엽니다.")
+    map_options.add_argument("--no-map", action="store_true", help="지도 HTML 저장을 생략합니다.")
     args = parser.parse_args()
     load_dotenv(ROOT / ".env")
     copa_key = os.getenv("COPA_API_KEY", "").strip()
@@ -284,29 +394,43 @@ def main():
         return 2
 
     travel_date = args.date.isoformat()
+    if not args.no_cache:
+        cached = find_latest_cache(travel_date, args.restaurant_count, model, not args.no_map)
+        if cached is not None:
+            print("저장된 결과를 재사용합니다. 외부 API 호출을 생략합니다.")
+            show_results(cached, args.open_map)
+            return 0
+
     errors = []
-    data = {"travel_date": travel_date, "recommendation": None, "restaurants": [], "errors": errors}
+    data = {
+        "cache_version": CACHE_VERSION,
+        "travel_date": travel_date,
+        "restaurant_count": args.restaurant_count,
+        "model": model,
+        "recommendation": None,
+        "restaurants": [],
+        "errors": errors,
+    }
     exit_code = 0
     print(f"[1/3] {travel_date} 여행지 추천 요청")
     try:
         data["recommendation"] = recommend(travel_date, copa_key, model, errors)
     except ApiError as exc:
-        record_error(errors, f"Copa 1차 추천 실패. {exc}")
+        record_error(errors, "recommendation", "copa", f"1차 추천 실패. {exc}")
         exit_code = 1
 
     if data["recommendation"] is not None:
         print("[2/3] Kakao Local 맛집 검색")
-        try:
-            data["restaurants"] = search_restaurants(data["recommendation"]["recommended_city"], kakao_key)
-            print(f"맛집 검색 결과 {len(data['restaurants'])}건")
-        except ApiError as exc:
-            record_error(errors, f"Kakao Local 맛집 검색 실패. {exc}")
+        data["restaurants"] = collect_restaurants(
+            data["recommendation"]["recommended_cities"], KakaoPlaceSearchProvider(kakao_key),
+            args.restaurant_count, errors,
+        )
 
         print("[3/3] Copa 여행 리포트 생성")
         try:
             report = generate_report(data, copa_key, model)
         except (ApiError, ValueError) as exc:
-            record_error(errors, f"Copa 리포트 생성 실패. {exc} 기본 양식으로 저장합니다.")
+            record_error(errors, "report", "copa", f"리포트 생성 실패. {exc} 기본 양식으로 저장합니다.")
             report = fallback_report(data["recommendation"], data["restaurants"])
             exit_code = 1
     else:
@@ -316,23 +440,17 @@ def main():
         f"# {travel_date} 국내 여행 리포트\n\n"
         "날씨는 계절적 경향이며 행사는 검토 후보입니다. 방문 전에 실제 예보와 개최 일정을 확인하세요.\n\n"
         f"{report}\n\n## errors\n\n"
-        + ("\n".join(f"- {error}" for error in errors) or "오류 없음")
+        + ("\n".join(
+            f"- `stage={error['stage']}` `provider={error['provider']}` message={error['message']}"
+            for error in errors
+        ) or "오류 없음")
     )
     try:
-        json_path, report_path, map_path = save_results(data, report)
+        paths = save_results(data, report, not args.no_map)
     except OSError:
         print("결과 파일 저장 실패. results 폴더의 쓰기 권한과 디스크 공간을 확인하세요.")
         return 1
-    print(f"원본 JSON 저장 경로: {json_path}")
-    print(f"여행 리포트 저장 경로: {report_path}")
-    print(f"맛집 지도 저장 경로: {map_path}")
-    if args.open_map:
-        try:
-            opened = webbrowser.open(map_path.as_uri())
-        except (OSError, webbrowser.Error):
-            opened = False
-        if not opened:
-            print("브라우저를 열 수 없습니다. 저장한 HTML 파일을 직접 열어주세요.")
+    show_results(paths, args.open_map)
     return exit_code
 
 
