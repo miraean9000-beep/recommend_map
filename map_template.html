@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>$city 맛집 지도</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/maplibre-gl@5.6.0/dist/maplibre-gl.css">
+  <style>
+    body { margin: 0 auto; max-width: 1100px; padding: 24px; font: 1rem/1.5 system-ui, sans-serif; color: #17312a; background: #f5f8f6; }
+    h1, h2, p { margin: 0 0 8px; }
+    main { display: grid; grid-template-columns: 2fr 1fr; gap: 24px; margin-top: 20px; }
+    #map { min-height: 480px; border-radius: 12px; background: #e4eee9; }
+    #status { padding: 12px 0; }
+    ol { padding-left: 24px; }
+    li { padding: 10px 0; border-bottom: 1px solid #cedbd4; }
+    a { color: #006648; }
+    .pin { width: 32px; height: 32px; padding: 0; border: 2px solid white; border-radius: 50%; background: #006648; color: white; font-weight: bold; cursor: pointer; }
+    @media (max-width: 680px) {
+      main { grid-template-columns: 1fr; }
+      #map { min-height: 360px; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>$city 맛집 지도</h1>
+    <p>여행일 $travel_date</p>
+  </header>
+  <main>
+    <section aria-label="맛집 위치">
+      <div id="map" hidden></div>
+      <p id="status" role="status">지도에 표시할 위치가 없습니다.</p>
+    </section>
+    <aside>
+      <h2>카카오 Local 검색 결과</h2>
+      <ol id="restaurants">
+$restaurants
+      </ol>
+    </aside>
+  </main>
+  <script src="https://cdn.jsdelivr.net/npm/maplibre-gl@5.6.0/dist/maplibre-gl.js"></script>
+  <script>
+    const places = Array.from(document.querySelectorAll("#restaurants li[data-x]"));
+    const container = document.getElementById("map");
+    const status = document.getElementById("status");
+
+    function showMap() {
+      if (!places.length) return;
+      container.hidden = false;
+      status.textContent = "지도를 불러오는 중입니다.";
+      try {
+        const map = new maplibregl.Map({
+          container,
+          style: "https://tiles.openfreemap.org/styles/liberty",
+          center: [Number(places[0].dataset.x), Number(places[0].dataset.y)],
+          zoom: 14
+        });
+        const bounds = new maplibregl.LngLatBounds();
+        for (const place of places) {
+          const position = [Number(place.dataset.x), Number(place.dataset.y)];
+          const pin = document.createElement("button");
+          pin.type = "button";
+          pin.className = "pin";
+          pin.textContent = Array.from(place.parentElement.children).indexOf(place) + 1;
+          pin.setAttribute("aria-label", place.querySelector("strong").textContent);
+          const popup = document.createElement("div");
+          for (const detail of place.children) popup.append(detail.cloneNode(true));
+          new maplibregl.Marker({element: pin})
+            .setLngLat(position)
+            .setPopup(new maplibregl.Popup().setDOMContent(popup))
+            .addTo(map);
+          bounds.extend(position);
+        }
+        map.addControl(new maplibregl.NavigationControl());
+        map.fitBounds(bounds, {padding: 48, maxZoom: 15, duration: 0});
+        map.once("load", () => { status.textContent = ""; });
+        map.on("error", () => {
+          status.textContent = "지도 일부를 불러오지 못했습니다. 목록의 카카오맵 링크에서 위치를 확인할 수 있습니다.";
+        });
+      } catch {
+        container.hidden = true;
+        status.textContent = "지도를 불러오지 못했습니다. 목록의 카카오맵 링크에서 위치를 확인할 수 있습니다.";
+      }
+    }
+
+    showMap();
+  </script>
+</body>
+</html>
